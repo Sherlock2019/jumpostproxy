@@ -1,28 +1,62 @@
 #!/usr/bin/env bash
 # Dry-run the whole kit end to end. Nothing is created, changed or deleted.
 #
-#   ./launch.sh              # preflight everything, print what WOULD happen
+#   sudo ./launch.sh         # ON THE JUMPHOST with ./env complete: installs
+#                            # EVERYTHING — deps, bastion, SSO proxy — and
+#                            # verifies it. This is the one command.
+#
+#   ./launch.sh              # anywhere else: preflight, changes nothing
+#   ./launch.sh --dry-run    # force the preflight even as root
 #   ./launch.sh --init       # create ./env, or top it up with new settings
 #   ./launch.sh --preview    # render the sign-in page and serve it locally
 #   ./launch.sh --verbose    # also print the rendered files
 #
-#   sudo ./launch.sh --install sso       # RUN ON THE JUMPHOST: install the
-#   sudo ./launch.sh --install bastion   # whole path, end to end, then verify
-#   sudo ./launch.sh --install all
+#   sudo ./launch.sh --install bastion   # just one path
+#   sudo ./launch.sh --install sso
 #
 # Use this before the first real run, and again after editing env. Every stage
 # is skipped gracefully when its prerequisites are absent, so this is safe to
 # run from a laptop with no cloud credentials and no jumphost.
 
 cd "$(dirname "$0")" || exit 1
-VERBOSE=0; INIT=0
+VERBOSE=0; INIT=0; FORCE_DRY=0
 case "${1:-}" in
   --verbose) VERBOSE=1 ;;
   --init)    INIT=1 ;;
   --preview) PREVIEW=1 ;;
-  --install) INSTALL="${2:-sso}" ;;
-  --help|-h) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  --install) INSTALL="${2:-all}" ;;
+  --dry-run) FORCE_DRY=1 ;;
+  --help|-h) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
+
+# Is every value this machine needs actually filled in?
+#   $1 = role. Prints nothing; returns the number of unfilled settings.
+cfg_missing() {
+  local role="$1" n=0 v
+  for v in APP_PRIVATE_IP APP_PORT COMPANY_CIDR; do
+    case "${!v-}" in
+      ''|*'<'*'>'*|0.0.0.0|10.0.0.0|203.0.113.0/24) n=$((n+1)) ;;
+    esac
+  done
+  if [ "$role" != bastion ]; then
+    for v in PUBLIC_HOSTNAME ENTRA_TENANT_ID ENTRA_CLIENT_ID ENTRA_CLIENT_SECRET; do
+      case "${!v-}" in
+        ''|*'<'*'>'*|app.example.com) n=$((n+1)) ;;
+      esac
+    done
+  fi
+  return "$n"
+}
+
+# Run bare, as root, on a machine whose config is complete? Then the intent is
+# obviously "set this up", not "show me a report" — so do it. Everywhere else,
+# including a laptop or a half-filled env, stays a dry run.
+if [ -z "${INSTALL:-}" ] && [ "${PREVIEW:-0}" != 1 ] && [ "$INIT" = 0 ] \
+   && [ "$FORCE_DRY" = 0 ] && [ "$(id -u)" -eq 0 ] && [ -f env ]; then
+  # shellcheck disable=SC1091
+  . ./env
+  if cfg_missing all; then INSTALL=all; fi
+fi
 
 # --init: create env from the template, or top up an existing one with any keys
 # added since it was made. Never changes a value you have already set.
@@ -85,24 +119,28 @@ if [ -n "${INSTALL:-}" ]; then
 
   printf '%s\n' "$B== junphostrain — installing '$ROLE' on $(hostname) ==$N"
 
-  # Refuse to install on a half-filled config. Doing so on the SSO path would
-  # stand up a proxy pointing at nothing, reachable from anywhere.
-  bad_cfg=0
-  for v in APP_PRIVATE_IP APP_PORT COMPANY_CIDR; do
-    case "${!v-}" in
-      ''|*'<'*'>'*|0.0.0.0|10.0.0.0|203.0.113.0/24)
-        printf '   %s✘%s %s is still an example value (%s)\n' "$R" "$N" "$v" "${!v-empty}"; bad_cfg=1 ;;
-    esac
-  done
-  if [ "$ROLE" != bastion ]; then
-    for v in PUBLIC_HOSTNAME ENTRA_TENANT_ID ENTRA_CLIENT_ID ENTRA_CLIENT_SECRET; do
+  # Refuse a half-filled config. On the SSO path that would stand up a proxy
+  # pointing at nothing, reachable from anywhere.
+  if ! cfg_missing "$ROLE"; then
+    printf '\n   %sConfiguration is incomplete:%s\n' "$R" "$N"
+    for v in APP_PRIVATE_IP APP_PORT COMPANY_CIDR PUBLIC_HOSTNAME \
+             ENTRA_TENANT_ID ENTRA_CLIENT_ID ENTRA_CLIENT_SECRET; do
+      [ "$ROLE" = bastion ] && case "$v" in PUBLIC_HOSTNAME|ENTRA_*) continue ;; esac
       case "${!v-}" in
-        ''|*'<'*'>'*|app.example.com)
-          printf '   %s✘%s %s is still an example value\n' "$R" "$N" "$v"; bad_cfg=1 ;;
+        ''|*'<'*'>'*|0.0.0.0|10.0.0.0|203.0.113.0/24|app.example.com)
+          printf '     %s✘%s %-22s %s\n' "$R" "$N" "$v" "${!v:-<empty>}" ;;
       esac
     done
+    printf '\n   Fill these in ./env, then re-run.\n'
+    exit 1
   fi
-  [ "$bad_cfg" = 1 ] && { printf '\n   Fill these in ./env first.\n'; exit 1; }
+
+  printf '\n   %sThis WILL change this machine.%s\n' "$Y" "$N"
+  printf '     app        : %s://%s:%s\n' "$APP_SCHEME" "$APP_PRIVATE_IP" "$APP_PORT"
+  printf '     inbound    : %s only\n' "$COMPANY_CIDR"
+  [ "$ROLE" != bastion ] && printf '     public URL : https://%s\n' "$PUBLIC_HOSTNAME"
+  printf '   %sCtrl-C now to stop, or run ./launch.sh --dry-run to preview.%s\n' "$D" "$N"
+  sleep 3
 
   title "Dependencies"
   ./install-requirements.sh "--$ROLE" || exit 1
