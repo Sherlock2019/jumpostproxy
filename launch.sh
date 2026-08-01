@@ -2,7 +2,13 @@
 # Dry-run the whole kit end to end. Nothing is created, changed or deleted.
 #
 #   ./launch.sh              # preflight everything, print what WOULD happen
+#   ./launch.sh --init       # create ./env, or top it up with new settings
+#   ./launch.sh --preview    # render the sign-in page and serve it locally
 #   ./launch.sh --verbose    # also print the rendered files
+#
+#   sudo ./launch.sh --install sso       # RUN ON THE JUMPHOST: install the
+#   sudo ./launch.sh --install bastion   # whole path, end to end, then verify
+#   sudo ./launch.sh --install all
 #
 # Use this before the first real run, and again after editing env. Every stage
 # is skipped gracefully when its prerequisites are absent, so this is safe to
@@ -13,18 +19,51 @@ VERBOSE=0; INIT=0
 case "${1:-}" in
   --verbose) VERBOSE=1 ;;
   --init)    INIT=1 ;;
-  --help|-h) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  --preview) PREVIEW=1 ;;
+  --install) INSTALL="${2:-sso}" ;;
+  --help|-h) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 
-# --init: create env from the template so the checklist below has something to
-# report on. Never overwrites an existing env.
+# --init: create env from the template, or top up an existing one with any keys
+# added since it was made. Never changes a value you have already set.
 if [ "$INIT" = 1 ]; then
   if [ -f env ]; then
-    printf 'env already exists — not overwriting. Edit it directly.\n'
+    added=0
+    while IFS= read -r line; do
+      case "$line" in
+        [A-Z_]*=*)
+          k="${line%%=*}"
+          grep -q "^${k}=" env || { printf '\n%s\n' "$line" >> env; added=$((added+1)); }
+          ;;
+      esac
+    done < env.example
+    [ "$added" -gt 0 ] \
+      && printf 'env exists — added %d new setting(s) from env.example.\n' "$added" \
+      || printf 'env already has every setting. Nothing changed.\n'
   else
     cp env.example env && chmod 600 env
     printf 'Created ./env (mode 600). Fill in the values marked below.\n'
   fi
+fi
+
+# --preview: render the sign-in page and serve it locally, so you can look at
+# the UI before any jumphost, DNS or Entra registration exists.
+if [ "${PREVIEW:-0}" = 1 ]; then
+  [ -f env ] && . ./env
+  command -v envsubst >/dev/null 2>&1 || { echo "need envsubst: sudo apt install gettext-base"; exit 1; }
+  D="$(mktemp -d)"; trap 'rm -rf "$D"' EXIT
+  export APP_NAME="${APP_NAME:-Application}" \
+         ORG_NAME="${ORG_NAME:-Rackspace}" \
+         ALLOWED_EMAIL_DOMAIN="${ALLOWED_EMAIL_DOMAIN:-rackspace.com}"
+  envsubst '${APP_NAME} ${ORG_NAME} ${ALLOWED_EMAIL_DOMAIN}' \
+    < sso-proxy/signin.html.tmpl > "$D/index.html"
+  P="${PREVIEW_PORT:-8088}"
+  printf '\n  Sign-in page preview:  http://localhost:%s\n' "$P"
+  printf '  Showing:  %s / %s / @%s\n' "$ORG_NAME" "$APP_NAME" "$ALLOWED_EMAIL_DOMAIN"
+  printf '  The button points at /oauth2/start, which only exists on the\n'
+  printf '  deployed proxy — clicking it here will 404. That is expected.\n'
+  printf '  Ctrl-C to stop.\n\n'
+  exec python3 -m http.server "$P" --directory "$D" --bind 127.0.0.1
 fi
 
 R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; B=$'\033[1m'; D=$'\033[2m'; N=$'\033[0m'
@@ -34,6 +73,56 @@ good()  { printf '   %s✔%s %s\n' "$G" "$N" "$1"; STAGE_OK=$((STAGE_OK+1)); }
 skip()  { printf '   %s–%s %s\n' "$Y" "$N" "$1"; STAGE_SKIP=$((STAGE_SKIP+1)); }
 bad()   { printf '   %s✘%s %s\n' "$R" "$N" "$1"; STAGE_FAIL=$((STAGE_FAIL+1)); }
 note()  { printf '     %s%s%s\n' "$D" "$1" "$N"; }
+
+# --install: the real thing. Runs ON THE JUMPHOST and does the whole path —
+# dependencies, config, service, verification — in one command.
+if [ -n "${INSTALL:-}" ]; then
+  ROLE="$INSTALL"
+  case "$ROLE" in sso|bastion|all) ;; *) echo "role must be sso | bastion | all"; exit 1 ;; esac
+  [ "$(id -u)" -eq 0 ] || { echo "run with sudo: sudo ./launch.sh --install $ROLE"; exit 1; }
+  [ -f env ] || { echo "no ./env — run ./launch.sh --init and fill it in first"; exit 1; }
+  . ./env
+
+  printf '%s\n' "$B== junphostrain — installing '$ROLE' on $(hostname) ==$N"
+
+  # Refuse to install on a half-filled config. Doing so on the SSO path would
+  # stand up a proxy pointing at nothing, reachable from anywhere.
+  bad_cfg=0
+  for v in APP_PRIVATE_IP APP_PORT COMPANY_CIDR; do
+    case "${!v-}" in
+      ''|*'<'*'>'*|0.0.0.0|10.0.0.0|203.0.113.0/24)
+        printf '   %s✘%s %s is still an example value (%s)\n' "$R" "$N" "$v" "${!v-empty}"; bad_cfg=1 ;;
+    esac
+  done
+  if [ "$ROLE" != bastion ]; then
+    for v in PUBLIC_HOSTNAME ENTRA_TENANT_ID ENTRA_CLIENT_ID ENTRA_CLIENT_SECRET; do
+      case "${!v-}" in
+        ''|*'<'*'>'*|app.example.com)
+          printf '   %s✘%s %s is still an example value\n' "$R" "$N" "$v"; bad_cfg=1 ;;
+      esac
+    done
+  fi
+  [ "$bad_cfg" = 1 ] && { printf '\n   Fill these in ./env first.\n'; exit 1; }
+
+  title "Dependencies"
+  ./install-requirements.sh "--$ROLE" || exit 1
+
+  if [ "$ROLE" = bastion ] || [ "$ROLE" = all ]; then
+    title "Bastion"
+    ./bastion/setup-bastion.sh || exit 1
+  fi
+  if [ "$ROLE" = sso ] || [ "$ROLE" = all ]; then
+    title "SSO proxy"
+    ./sso-proxy/setup-sso-proxy.sh || exit 1
+    title "Verifying"
+    ./sso-proxy/setup-sso-proxy.sh --verify
+  fi
+
+  printf '\n%s== done ==%s\n' "$B" "$N"
+  [ "$ROLE" != bastion ] && printf '   Share:  https://%s\n' "$PUBLIC_HOSTNAME"
+  [ "$ROLE" != sso ] && printf '   Add an engineer:  sudo ./bastion/add-engineer.sh <name> <key.pub>\n'
+  exit 0
+fi
 
 printf '%s\n' "$B== junphostrain — dry run ==$N"
 note "Nothing below creates, changes or deletes anything."

@@ -112,6 +112,32 @@ grep -Eq 'auth_request_set[[:space:]]+\$ar_email[[:space:]]+\$upstream_http_x_au
   sso-proxy/nginx-app-sso.conf.tmpl \
   && ok "identity taken from the verified subrequest" || no "identity not from auth_request"
 
+head_ "5b. Sign-in page collects nothing"
+if [ -f sso-proxy/signin.html.tmpl ]; then
+  grep -qiE 'type=["'"'"']?password|<input[^>]+pass' sso-proxy/signin.html.tmpl \
+    && no "sign-in page has a PASSWORD FIELD — credentials must go to Microsoft" \
+    || ok "no password field"
+  grep -qiE '<input' sso-proxy/signin.html.tmpl \
+    && no "sign-in page has an <input> — it should only link out" \
+    || ok "no input elements at all"
+  grep -qiE '<form' sso-proxy/signin.html.tmpl \
+    && no "sign-in page has a <form> — nothing should post here" \
+    || ok "no form"
+  grep -q '/oauth2/start' sso-proxy/signin.html.tmpl \
+    && ok "button starts the real OIDC flow" || no "button does not link to /oauth2/start"
+  grep -q 'die "signin.html contains a password field' sso-proxy/setup-sso-proxy.sh \
+    && ok "installer refuses a password field" || no "installer would install one"
+  # An absolute URL in ?rd= would make this page an open redirect.
+  grep -q "\^\\\\/(?!\\\\/)" sso-proxy/signin.html.tmpl \
+    && ok "rd= restricted to same-site paths (no open redirect)" \
+    || no "rd= not restricted — open-redirect risk"
+  grep -q 'auth_request off' sso-proxy/nginx-app-sso.conf.tmpl \
+    && ok "/signin is reachable without a session" \
+    || no "/signin behind auth — sign-in would deadlock"
+else
+  no "sso-proxy/signin.html.tmpl missing"
+fi
+
 head_ "6. Bastion restricts the key to a tunnel"
 grep -q 'restrict,port-forwarding,permitopen=' bastion/add-engineer.sh \
   && ok "authorized_keys uses restrict + permitopen" || no "key is not restricted"

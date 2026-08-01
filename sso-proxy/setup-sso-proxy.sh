@@ -76,6 +76,18 @@ export APP_SCHEME APP_PRIVATE_IP APP_PORT PUBLIC_HOSTNAME TLS_CERT TLS_KEY
 envsubst '${APP_SCHEME} ${APP_PRIVATE_IP} ${APP_PORT} ${PUBLIC_HOSTNAME} ${TLS_CERT} ${TLS_KEY}' \
   < "$HERE/nginx-app-sso.conf.tmpl" > "$RENDER_DIR/app-sso.conf"
 
+# ── branded sign-in page ────────────────────────────────────────────────────
+export APP_NAME="${APP_NAME:-Application}" ORG_NAME="${ORG_NAME:-Rackspace}" ALLOWED_EMAIL_DOMAIN
+envsubst '${APP_NAME} ${ORG_NAME} ${ALLOWED_EMAIL_DOMAIN}' \
+  < "$HERE/signin.html.tmpl" > "$RENDER_DIR/signin.html"
+
+# A password field here would defeat the entire design, so fail loudly if one
+# ever appears — including via a hand-edited template.
+if grep -qiE 'type=["'"'"']?password|<input[^>]+pass' "$RENDER_DIR/signin.html"; then
+  die "signin.html contains a password field — refusing to install. \
+Credentials must be entered on login.microsoftonline.com, never here."
+fi
+
 # ── oauth2-proxy config ─────────────────────────────────────────────────────
 COOKIE_SECRET="$(openssl rand -base64 32 | tr -- '+/' '-_')"
 {
@@ -119,6 +131,7 @@ chmod 600 "$RENDER_DIR/oauth2-proxy.cfg"
 if [ "$DRY" = 1 ]; then
   step "Rendered (not installed)"
   echo "  $RENDER_DIR/app-sso.conf"
+  echo "  $RENDER_DIR/signin.html        (branded sign-in page, no password field)"
   echo "  $RENDER_DIR/oauth2-proxy.cfg   (contains a generated cookie secret)"
   c_dim "  Re-run without --dry-run to install."
   exit 0
@@ -145,6 +158,7 @@ c_grn "  $TLS_CERT"
 step "Installing"
 install -D -m 600 "$RENDER_DIR/oauth2-proxy.cfg" "$O2P_CFG"
 install -D -m 644 "$RENDER_DIR/app-sso.conf" "$NGINX_SITE"
+install -D -m 644 "$RENDER_DIR/signin.html" /var/www/sso-signin/signin.html
 ln -sf "$NGINX_SITE" /etc/nginx/sites-enabled/app-sso.conf
 rm -f /etc/nginx/sites-enabled/default
 

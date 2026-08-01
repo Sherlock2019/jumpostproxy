@@ -60,11 +60,30 @@ server {
         proxy_pass_request_body         off;
     }
 
-    # Relative redirect on purpose: oauth2-proxy rebuilds the absolute URL from
-    # its own redirect_url, so a forged Host header cannot steer it.
+    # ── The branded sign-in page. Unauthenticated by necessity: it is what an
+    #    unauthenticated visitor is sent to. It contains no password field — the
+    #    button on it starts the real OIDC flow and Microsoft collects the
+    #    credential. See signin.html.tmpl for why that matters.
+    location = /signin {
+        auth_request off;
+        root /var/www/sso-signin;
+        try_files /signin.html =404;
+        add_header Cache-Control "no-store";
+    }
+
+    # Relative redirect on purpose: an absolute URL here could be steered by a
+    # forged Host header.
     location @sso_signin {
         internal;
-        return 302 /oauth2/start?rd=$request_uri;
+        return 302 /signin?rd=$request_uri;
+    }
+
+    # oauth2-proxy sends a signed-in-but-not-permitted user here (wrong domain,
+    # not in the allowed group). Without this they get its bare 403.
+    error_page 403 = @sso_denied;
+    location @sso_denied {
+        internal;
+        return 302 /signin?e=denied;
     }
 
     location / {
