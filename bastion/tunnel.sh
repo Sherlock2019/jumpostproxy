@@ -25,13 +25,20 @@ fi
 if [ "${1:-}" = "--test" ]; then
   step "Testing the path"
   printf '  ssh to bastion ... '
+  # Capture into a variable, not a fixed /tmp file: with fs.protected_regular
+  # set, a file left behind by another user makes the redirect fail and the
+  # error come back empty.
   if ssh -o BatchMode=yes -o ConnectTimeout=8 -p "$BASTION_SSH_PORT" \
-         -O check "$TARGET" >/dev/null 2>&1 ||
-     ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new \
-         -p "$BASTION_SSH_PORT" -N -f -L "$FWD" "$TARGET" 2>/tmp/jh.err; then
+         -O check "$TARGET" >/dev/null 2>&1; then
+    c_grn "ok (existing session)"
+  elif sshrr="$(ssh -o BatchMode=yes -o ConnectTimeout=8 \
+                    -o StrictHostKeyChecking=accept-new \
+                    -p "$BASTION_SSH_PORT" -N -f -L "$FWD" "$TARGET" 2>&1)"; then
     c_grn "ok"
   else
-    c_red "failed"; sed 's/^/    /' /tmp/jh.err; exit 1
+    c_red "failed"
+    printf '%s\n' "${sshrr:-no output from ssh}" | sed 's/^/    /'
+    exit 1
   fi
   sleep 1
   printf '  app through tunnel ... '

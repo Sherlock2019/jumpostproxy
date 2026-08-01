@@ -29,6 +29,22 @@ case "${1:-}" in
   --help|-h) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 
+# Open a URL in whatever browser this machine can reach. WSL is handled first:
+# xdg-open exists there but usually fails, while wslview / explorer.exe reach the
+# Windows browser. Silent no-op on a headless jumphost — printing the URL is the
+# fallback, and the caller always prints it too.
+open_url() {
+  local url="$1"
+  if grep -qi microsoft /proc/version 2>/dev/null; then
+    command -v wslview     >/dev/null 2>&1 && { wslview "$url" >/dev/null 2>&1 & return 0; }
+    command -v explorer.exe >/dev/null 2>&1 && { explorer.exe "$url" >/dev/null 2>&1 & return 0; }
+  fi
+  for o in xdg-open open sensible-browser x-www-browser; do
+    command -v "$o" >/dev/null 2>&1 && { "$o" "$url" >/dev/null 2>&1 & return 0; }
+  done
+  return 1
+}
+
 # Is every value this machine needs actually filled in?
 #   $1 = role. Prints nothing; returns the number of unfilled settings.
 cfg_missing() {
@@ -92,11 +108,14 @@ if [ "${PREVIEW:-0}" = 1 ]; then
   envsubst '${APP_NAME} ${ORG_NAME} ${ALLOWED_EMAIL_DOMAIN}' \
     < sso-proxy/signin.html.tmpl > "$D/index.html"
   P="${PREVIEW_PORT:-8088}"
-  printf '\n  Sign-in page preview:  http://localhost:%s\n' "$P"
+  URL="http://localhost:$P"
+  printf '\n  Sign-in page preview:  %s\n' "$URL"
   printf '  Showing:  %s / %s / @%s\n' "$ORG_NAME" "$APP_NAME" "$ALLOWED_EMAIL_DOMAIN"
   printf '  The button points at /oauth2/start, which only exists on the\n'
   printf '  deployed proxy — clicking it here will 404. That is expected.\n'
   printf '  Ctrl-C to stop.\n\n'
+  # Give the server a moment to bind before the browser asks for the page.
+  ( sleep 1; open_url "$URL" || printf '  (open %s yourself)\n' "$URL" ) &
   exec python3 -m http.server "$P" --directory "$D" --bind 127.0.0.1
 fi
 
@@ -157,7 +176,13 @@ if [ -n "${INSTALL:-}" ]; then
   fi
 
   printf '\n%s== done ==%s\n' "$B" "$N"
-  [ "$ROLE" != bastion ] && printf '   Share:  https://%s\n' "$PUBLIC_HOSTNAME"
+  if [ "$ROLE" != bastion ]; then
+    printf '   Share this link:  %shttps://%s%s\n' "$G" "$PUBLIC_HOSTNAME" "$N"
+    printf '   Colleagues sign in with their company account. No credential changes hands.\n'
+    # Only worth attempting where a browser can exist; a jumphost is usually
+    # headless, and the URL above is the real deliverable either way.
+    open_url "https://$PUBLIC_HOSTNAME" 2>/dev/null && printf '   (opening it now)\n'
+  fi
   [ "$ROLE" != sso ] && printf '   Add an engineer:  sudo ./bastion/add-engineer.sh <name> <key.pub>\n'
   exit 0
 fi
