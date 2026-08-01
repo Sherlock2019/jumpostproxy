@@ -9,7 +9,23 @@
 # run from a laptop with no cloud credentials and no jumphost.
 
 cd "$(dirname "$0")" || exit 1
-VERBOSE=0; [ "${1:-}" = "--verbose" ] && VERBOSE=1
+VERBOSE=0; INIT=0
+case "${1:-}" in
+  --verbose) VERBOSE=1 ;;
+  --init)    INIT=1 ;;
+  --help|-h) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+
+# --init: create env from the template so the checklist below has something to
+# report on. Never overwrites an existing env.
+if [ "$INIT" = 1 ]; then
+  if [ -f env ]; then
+    printf 'env already exists — not overwriting. Edit it directly.\n'
+  else
+    cp env.example env && chmod 600 env
+    printf 'Created ./env (mode 600). Fill in the values marked below.\n'
+  fi
+fi
 
 R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; B=$'\033[1m'; D=$'\033[2m'; N=$'\033[0m'
 STAGE_OK=0; STAGE_SKIP=0; STAGE_FAIL=0
@@ -38,8 +54,9 @@ fi
 
 # ── 2. configuration ────────────────────────────────────────────────────────
 title "2. Configuration (env)"
+TODO=0
 if [ ! -f env ]; then
-  skip "no env yet  —  cp env.example env && chmod 600 env && \$EDITOR env"
+  skip "no env yet  —  run:  ./launch.sh --init"
   note "Later stages need it, so they will be skipped too."
 else
   # shellcheck disable=SC1091
@@ -48,18 +65,21 @@ else
   [ "$perm" = "600" ] && good "env present, mode 600" \
                       || bad "env is mode $perm — chmod 600 env (it holds a client secret)"
 
-  placeholder=0
+  # A value still on its example is a TODO, not a failure: the scripts
+  # themselves refuse to run on placeholders, so this is a checklist, not a gate.
   for v in APP_PRIVATE_IP APP_PORT COMPANY_CIDR BASTION_FLOATING_IP; do
     val="${!v-}"
     case "$val" in
       ''|*'<'*'>'*|0.0.0.0|10.0.0.0|203.0.113.0/24)
-        bad "$v is still unset or an example value ($val)"; placeholder=1 ;;
+        skip "$v — still to fill in  (currently: ${val:-empty})"; TODO=$((TODO+1)) ;;
       *) good "$v = $val" ;;
     esac
   done
+  # This one is never a TODO. It is the outer gate.
   case "${COMPANY_CIDR:-}" in
     0.0.0.0/0) bad "COMPANY_CIDR is 0.0.0.0/0 — that publishes the jumphost to the internet" ;;
   esac
+  [ "$TODO" -gt 0 ] && note "Edit ./env, then re-run ./launch.sh"
 fi
 
 # ── 3. OpenStack plan ───────────────────────────────────────────────────────
@@ -141,12 +161,26 @@ printf '   %s%d ok%s   %s%d skipped%s   %s%d problems%s\n' \
   "$G" "$STAGE_OK" "$N" "$Y" "$STAGE_SKIP" "$N" "$R" "$STAGE_FAIL" "$N"
 
 if [ "$STAGE_FAIL" -gt 0 ]; then
-  printf '\n   Fix the ✘ items before any real run.\n'
+  printf '\n   Fix the %s✘%s items before any real run.\n' "$R" "$N"
   exit 1
+fi
+
+if [ ! -f env ]; then
+  cat <<NEXT
+
+   Next:  ./launch.sh --init      creates ./env for you
+          \$EDITOR env             fill in the marked values
+          ./launch.sh             re-check
+NEXT
+  exit 0
+fi
+if [ "${TODO:-0}" -gt 0 ]; then
+  printf '\n   %d value(s) still to fill in ./env, then re-run ./launch.sh\n' "$TODO"
+  exit 0
 fi
 cat <<NEXT
 
-   When you are ready, in this order:
+   Config looks complete. When you are ready, in this order:
      source ~/openrc.sh
      ./openstack/provision-jumphost.sh          # creates the VM + floating IP
      # copy the printed IP into env as BASTION_FLOATING_IP, then ON the jumphost:
