@@ -5,7 +5,9 @@
 #                            # EVERYTHING — deps, bastion, SSO proxy — and
 #                            # verifies it. This is the one command.
 #
-#   ./launch.sh              # anywhere else: preflight, changes nothing
+#   ./launch.sh              # anywhere else: preflight, then SHOW the sign-in
+#                            # page in your browser. Changes nothing.
+#   ./launch.sh --no-web     # preflight only, no page, no browser
 #   ./launch.sh --dry-run    # force the preflight even as root
 #   ./launch.sh --init       # create ./env, or top it up with new settings
 #   ./launch.sh --preview    # render the sign-in page and serve it locally
@@ -26,6 +28,7 @@ case "${1:-}" in
   --preview) PREVIEW=1 ;;
   --install) INSTALL="${2:-all}" ;;
   --dry-run) FORCE_DRY=1 ;;
+  --no-web)  NO_WEB=1 ;;
   --help|-h) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 
@@ -96,36 +99,50 @@ if [ "$INIT" = 1 ]; then
   fi
 fi
 
-# --preview: render the sign-in page and serve it locally, so you can look at
-# the UI before any jumphost, DNS or Entra registration exists.
-if [ "${PREVIEW:-0}" = 1 ]; then
+# Render the sign-in page and serve it locally, so the UI can be seen before any
+# jumphost, DNS or Entra registration exists. Used by --preview and by the tail
+# of a normal dry run.
+serve_preview() {
   [ -f env ] && . ./env
-  command -v envsubst >/dev/null 2>&1 || { echo "need envsubst: sudo apt install gettext-base"; exit 1; }
+  if ! command -v envsubst >/dev/null 2>&1; then
+    printf '   (no envsubst — sudo apt install gettext-base to preview the page)\n'; return 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf '   (no python3 — cannot serve the preview)\n'; return 1
+  fi
   D="$(mktemp -d)"; trap 'rm -rf "$D"' EXIT
   export APP_NAME="${APP_NAME:-Application}" \
          ORG_NAME="${ORG_NAME:-Rackspace}" \
          ALLOWED_EMAIL_DOMAIN="${ALLOWED_EMAIL_DOMAIN:-rackspace.com}"
   envsubst '${APP_NAME} ${ORG_NAME} ${ALLOWED_EMAIL_DOMAIN}' \
     < sso-proxy/signin.html.tmpl > "$D/index.html"
-  P="${PREVIEW_PORT:-8088}"
-  URL="http://localhost:$P"
-  printf '\n  Sign-in page preview:  %s\n' "$URL"
-  printf '  Showing:  %s / %s / @%s\n' "$ORG_NAME" "$APP_NAME" "$ALLOWED_EMAIL_DOMAIN"
-  printf '  The button points at /oauth2/start, which only exists on the\n'
-  printf '  deployed proxy — clicking it here will 404. That is expected.\n'
-  printf '  Ctrl-C to stop.\n\n'
-  # Give the server a moment to bind before the browser asks for the page.
-  ( sleep 1; open_url "$URL" || printf '  (open %s yourself)\n' "$URL" ) &
-  exec python3 -m http.server "$P" --directory "$D" --bind 127.0.0.1
-fi
 
-R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; B=$'\033[1m'; D=$'\033[2m'; N=$'\033[0m'
+  local P="${PREVIEW_PORT:-8088}"
+  # A port already in use would make the server exit and the browser show
+  # somebody else's page, which is worse than saying so.
+  if command -v ss >/dev/null 2>&1 && ss -ltn "( sport = :$P )" 2>/dev/null | grep -q LISTEN; then
+    printf '   port %s is in use — retry with PREVIEW_PORT=<other> ./launch.sh\n' "$P"; return 1
+  fi
+  local URL="http://localhost:$P"
+  printf '\n%s   Sign-in page:  %s%s\n' "$G" "$URL" "$N"
+  printf '   Showing: %s / %s / @%s\n' "$ORG_NAME" "$APP_NAME" "$ALLOWED_EMAIL_DOMAIN"
+  printf '   The button goes to /oauth2/start, which only exists on the deployed\n'
+  printf '   proxy — clicking it here 404s. That is expected.\n'
+  printf '   %sCtrl-C to stop.%s\n\n' "$D_" "$N"
+  ( sleep 1; open_url "$URL" || printf '   (open %s yourself)\n' "$URL" ) &
+  exec python3 -m http.server "$P" --directory "$D" --bind 127.0.0.1
+}
+
+if [ "${PREVIEW:-0}" = 1 ]; then serve_preview; exit $?; fi
+
+# D_ not D: serve_preview() uses D for its temp directory.
+R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; B=$'\033[1m'; D_=$'\033[2m'; N=$'\033[0m'
 STAGE_OK=0; STAGE_SKIP=0; STAGE_FAIL=0
 title() { printf '\n%s┌─ %s %s\n' "$B" "$1" "$N"; }
 good()  { printf '   %s✔%s %s\n' "$G" "$N" "$1"; STAGE_OK=$((STAGE_OK+1)); }
 skip()  { printf '   %s–%s %s\n' "$Y" "$N" "$1"; STAGE_SKIP=$((STAGE_SKIP+1)); }
 bad()   { printf '   %s✘%s %s\n' "$R" "$N" "$1"; STAGE_FAIL=$((STAGE_FAIL+1)); }
-note()  { printf '     %s%s%s\n' "$D" "$1" "$N"; }
+note()  { printf '     %s%s%s\n' "$D_" "$1" "$N"; }
 
 # --install: the real thing. Runs ON THE JUMPHOST and does the whole path —
 # dependencies, config, service, verification — in one command.
@@ -158,7 +175,7 @@ if [ -n "${INSTALL:-}" ]; then
   printf '     app        : %s://%s:%s\n' "$APP_SCHEME" "$APP_PRIVATE_IP" "$APP_PORT"
   printf '     inbound    : %s only\n' "$COMPANY_CIDR"
   [ "$ROLE" != bastion ] && printf '     public URL : https://%s\n' "$PUBLIC_HOSTNAME"
-  printf '   %sCtrl-C now to stop, or run ./launch.sh --dry-run to preview.%s\n' "$D" "$N"
+  printf '   %sCtrl-C now to stop, or run ./launch.sh --dry-run to preview.%s\n' "$D_" "$N"
   sleep 3
 
   title "Dependencies"
@@ -324,18 +341,22 @@ if [ ! -f env ]; then
           \$EDITOR env             fill in the marked values
           ./launch.sh             re-check
 NEXT
-  exit 0
-fi
-if [ "${TODO:-0}" -gt 0 ]; then
+elif [ "${TODO:-0}" -gt 0 ]; then
   printf '\n   %d value(s) still to fill in ./env, then re-run ./launch.sh\n' "$TODO"
-  exit 0
-fi
-cat <<NEXT
+else
+  cat <<NEXT
 
    Config looks complete. When you are ready, in this order:
      source ~/openrc.sh
      ./openstack/provision-jumphost.sh          # creates the VM + floating IP
      # copy the printed IP into env as BASTION_FLOATING_IP, then ON the jumphost:
-     sudo ./bastion/setup-bastion.sh            # tunnel path
-     sudo ./sso-proxy/setup-sso-proxy.sh        # SSO path
+     sudo ./launch.sh                           # installs everything, verifies
 NEXT
+fi
+
+# Finish by putting the sign-in page on screen. The report says what will
+# happen; this shows what people will actually see. Skipped as root (a jumphost
+# is usually headless and this would block the terminal) and with --no-web.
+if [ "${NO_WEB:-0}" != 1 ] && [ "$(id -u)" -ne 0 ]; then
+  serve_preview || true
+fi
