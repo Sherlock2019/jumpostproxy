@@ -10,6 +10,8 @@
 #   ./launch.sh --no-web     # preflight only, no page, no browser
 #   ./launch.sh --dry-run    # force the preflight even as root
 #   ./launch.sh --init       # create ./env, or top it up with new settings
+#   ./launch.sh --discover   # ON THE JUMPHOST: read what this VM already knows
+#                            # (floating IP, app if local) and write it to env
 #   ./launch.sh --preview    # render the sign-in page and serve it locally
 #   ./launch.sh --verbose    # also print the rendered files
 #
@@ -29,6 +31,7 @@ case "${1:-}" in
   --install) INSTALL="${2:-all}" ;;
   --dry-run) FORCE_DRY=1 ;;
   --no-web)  NO_WEB=1 ;;
+  --discover) exec ./discover.sh "${2:-write}" ;;
   --help|-h) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 
