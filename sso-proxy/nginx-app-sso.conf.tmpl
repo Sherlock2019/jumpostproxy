@@ -1,0 +1,113 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Reverse proxy: company SSO in front of an app that stays on a private IP.
+#
+# Template — setup-sso-proxy.sh substitutes ${...} and installs the result.
+# Do not edit the installed copy; edit this and re-run.
+#
+#   colleague ──TLS──▶ nginx (floating IP) ──auth──▶ oauth2-proxy ──▶ Entra ID
+#                          │
+#                          ▼
+#                     ${APP_SCHEME}://${APP_PRIVATE_IP}:${APP_PORT}
+#
+# The app never gets a public address and never learns about SSO. It keeps
+# listening on its private IP exactly as it does today.
+# ─────────────────────────────────────────────────────────────────────────────
+
+server {
+    listen 80;
+    server_name ${PUBLIC_HOSTNAME};
+    # ACME needs port 80 reachable; everything else goes to TLS.
+    location /.well-known/acme-challenge/ { root /var/www/html; }
+    location / { return 301 https://$host$request_uri; }
+}
+
+server {
+    listen 443 ssl http2;
+    server_name ${PUBLIC_HOSTNAME};
+
+    ssl_certificate     ${TLS_CERT};
+    ssl_certificate_key ${TLS_KEY};
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    client_max_body_size 64M;
+
+    # Sensible defaults for anything sitting on the public internet.
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    server_tokens off;
+
+    # ── oauth2-proxy's own endpoints. Must stay unauthenticated or sign-in
+    #    deadlocks: you cannot log in through a page that requires being logged in.
+    location /oauth2/ {
+        proxy_pass       http://127.0.0.1:4180;
+        proxy_set_header Host                    $host;
+        proxy_set_header X-Real-IP               $remote_addr;
+        proxy_set_header X-Scheme                $scheme;
+        proxy_set_header X-Auth-Request-Redirect $request_uri;
+    }
+
+    # ── The auth subrequest. Body is dropped: without this nginx forwards the
+    #    entire upload to the auth check as well as to the app.
+    location = /oauth2/auth {
+        internal;
+        proxy_pass                      http://127.0.0.1:4180;
+        proxy_set_header Host           $host;
+        proxy_set_header X-Real-IP      $remote_addr;
+        proxy_set_header X-Scheme       $scheme;
+        proxy_set_header Content-Length "";
+        proxy_pass_request_body         off;
+    }
+
+    # Relative redirect on purpose: oauth2-proxy rebuilds the absolute URL from
+    # its own redirect_url, so a forged Host header cannot steer it.
+    location @sso_signin {
+        internal;
+        return 302 /oauth2/start?rd=$request_uri;
+    }
+
+    location / {
+        auth_request /oauth2/auth;
+        error_page 401 = @sso_signin;
+
+        # Identity, captured from the VERIFIED subrequest response only.
+        auth_request_set $ar_user   $upstream_http_x_auth_request_user;
+        auth_request_set $ar_email  $upstream_http_x_auth_request_email;
+        auth_request_set $ar_pref   $upstream_http_x_auth_request_preferred_username;
+        auth_request_set $ar_groups $upstream_http_x_auth_request_groups;
+
+        proxy_pass         ${APP_SCHEME}://${APP_PRIVATE_IP}:${APP_PORT};
+        proxy_http_version 1.1;
+
+        # WebSocket / SSE. Many dashboards stream; without these they hang.
+        proxy_set_header   Upgrade    $http_upgrade;
+        proxy_set_header   Connection $connection_upgrade;
+        proxy_buffering    off;
+        proxy_cache        off;
+        proxy_read_timeout 3600s;
+
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+
+        # Pass the signed-in identity to the app, should it want it.
+        proxy_set_header X-Auth-Request-Email              $ar_email;
+        proxy_set_header X-Auth-Request-User               $ar_user;
+        proxy_set_header X-Auth-Request-Preferred-Username $ar_pref;
+        proxy_set_header X-Auth-Request-Groups             $ar_groups;
+
+        # ── CRITICAL: blank the header names an app might trust, so a visitor
+        #    cannot smuggle an identity past the proxy. nginx forwards unknown
+        #    client headers verbatim; without these a browser could simply send
+        #    `X-Forwarded-User: someone.else@rackspace.com`.
+        proxy_set_header X-Forwarded-User               "";
+        proxy_set_header X-SSO-User                     "";
+        proxy_set_header X-Forwarded-Preferred-Username "";
+        proxy_set_header X-SSO-Role                     "";
+        proxy_set_header X-Forwarded-Groups             "";
+        proxy_set_header X-Remote-User                  "";
+        proxy_set_header Remote-User                    "";
+    }
+}

@@ -1,0 +1,17 @@
+# The filled-in config: internal IPs, and on the SSO path an Entra client
+# secret. Only env.example is ever committed.
+env
+
+# Rendered output — contains the generated cookie secret and the client secret.
+.rendered/
+oauth2-proxy.cfg
+**/oauth2-proxy.cfg
+!**/oauth2-proxy.cfg.example
+
+# Keys, certs, OpenRC
+*.pem
+*.key
+!**/*.pub
+openrc*
+*openrc*
+authorized_keys*
